@@ -281,6 +281,7 @@
     let micEnabled = true;
     let cameraEnabled = true;
     let facingMode = 'user';
+    let isCallActive = false;
 
     const loginContainer = document.getElementById('login-container');
     const loadingContainer = document.getElementById('loading-container');
@@ -304,8 +305,10 @@
     const servers = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
-      ]
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' }
+      ],
+      iceCandidatePoolSize: 10
     };
 
     const urlParams = new URLSearchParams(window.location.search);
@@ -426,7 +429,10 @@
           .eq('id', urlChatId)
           .single();
 
-        if (chatError) throw chatError;
+        if (chatError) {
+          statusEl.innerText = 'Чат не найден';
+          return;
+        }
 
         if (chat) {
           chatId = chat.id;
@@ -436,10 +442,10 @@
             .eq('id', otherUserId)
             .single();
           callTitle.innerText = `Звонок с ${otherProfile?.username || 'Пользователь'}`;
-        } else {
-          statusEl.innerText = 'Чат не найден';
-          return;
         }
+
+        // Подписка на изменения звонков ДО начала звонка
+        subscribeToCalls();
 
         const { data: existingCall, error: callError } = await supabase.from('calls')
           .select('*')
@@ -466,8 +472,6 @@
           await startCall();
         }
 
-        subscribeToCalls();
-
         fullscreenToggleBtn.onclick = () => {
           videoGrid.classList.toggle('fullscreen-remote');
           fullscreenToggleBtn.innerHTML = `<i class="fa fa-${videoGrid.classList.contains('fullscreen-remote') ? 'compress' : 'expand'}"></i>`;
@@ -485,55 +489,73 @@
       try {
         console.log('Starting call, isCaller:', isCaller, 'chatId:', chatId);
         
+        // Получаем медиапоток
         localStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: facingMode },
+          video: { facingMode: facingMode, width: 1280, height: 720 },
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl: true,
-            sampleRate: 48000
+            autoGainControl: true
           }
         });
         localVideo.srcObject = localStream;
 
+        // Создаем peer connection
         peerConnection = new RTCPeerConnection(servers);
-        localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
 
+        // Добавляем треки локального потока
+        localStream.getTracks().forEach(track => {
+          peerConnection.addTrack(track, localStream);
+        });
+
+        // Создаем удаленный поток
         remoteStream = new MediaStream();
         remoteVideo.srcObject = remoteStream;
+
+        // Обработка удаленного потока
         peerConnection.ontrack = (event) => {
-          event.streams[0].getTracks().forEach(track => remoteStream.addTrack(track));
+          console.log('Received remote track:', event.track.kind);
+          remoteStream.addTrack(event.track);
         };
 
-        peerConnection.onicecandidate = async (event) => {
+        // Обработка ICE кандидатов
+        peerConnection.onicecandidate = (event) => {
           if (event.candidate) {
-            try {
-              await supabase.from('calls').update({
-                ice_candidates: [...(await getCurrentIceCandidates() || []), event.candidate]
-              }).eq('id', callId);
-            } catch (err) {
-              console.error('Error sending ICE candidate:', err);
-            }
+            console.log('New ICE candidate:', event.candidate);
+            sendIceCandidate(event.candidate);
           }
         };
 
+        // Обработка изменения состояния соединения
         peerConnection.onconnectionstatechange = () => {
-          console.log('Connection state:', peerConnection.connectionState);
-          if (peerConnection.connectionState === 'connected') {
-            statusEl.innerText = 'Соединение установлено';
-          } else if (peerConnection.connectionState === 'failed') {
-            console.error('Connection failed');
-            endCall();
+          console.log('Connection state changed:', peerConnection.connectionState);
+          switch (peerConnection.connectionState) {
+            case 'connected':
+              statusEl.innerText = 'Соединение установлено';
+              isCallActive = true;
+              break;
+            case 'disconnected':
+            case 'failed':
+              console.log('Connection failed or disconnected');
+              if (isCallActive) {
+                endCall();
+              }
+              break;
+            case 'closed':
+              console.log('Connection closed');
+              break;
           }
         };
 
-        if (!callId) {
+        // Создаем офер только если мы звоним
+        if (isCaller) {
           const offer = await peerConnection.createOffer({
             offerToReceiveAudio: true,
             offerToReceiveVideo: true
           });
           await peerConnection.setLocalDescription(offer);
-          
+
+          // Создаем запись о звонке в базе данных
           const { data: callData, error } = await supabase.from('calls').insert({
             caller_id: currentUser.id,
             receiver_id: otherUserId,
@@ -544,10 +566,15 @@
             ice_candidates: []
           }).select('id').single();
           
-          if (error) throw error;
+          if (error) {
+            console.error('Error creating call:', error);
+            return;
+          }
           
           callId = callData.id;
-          
+          console.log('Call created with ID:', callId);
+
+          // Отправляем сообщение в чат
           const messageContent = `Я звоню вам. Присоединяйтесь: ${window.location.origin}${window.location.pathname}?chat_id=${chatId}`;
           await supabase.from('messages').insert({
             chat_id: chatId,
@@ -559,18 +586,42 @@
 
         statusEl.innerText = isCaller ? 'Ожидание ответа...' : 'Соединение устанавливается...';
         endCallBtn.disabled = false;
+
       } catch (err) {
         console.error('startCall error:', err);
-        statusEl.innerText = 'Ошибка начала звонка';
+        statusEl.innerText = 'Ошибка начала звонка: ' + err.message;
+      }
+    }
+
+    async function sendIceCandidate(candidate) {
+      if (!callId) return;
+      
+      try {
+        // Получаем текущие кандидаты и добавляем новый
+        const { data: currentCall } = await supabase.from('calls')
+          .select('ice_candidates')
+          .eq('id', callId)
+          .single();
+
+        const currentCandidates = currentCall?.ice_candidates || [];
+        const updatedCandidates = [...currentCandidates, candidate];
+
+        await supabase.from('calls')
+          .update({ ice_candidates: updatedCandidates })
+          .eq('id', callId);
+      } catch (err) {
+        console.error('Error sending ICE candidate:', err);
       }
     }
 
     async function endCall() {
+      if (!isCallActive && callId) return;
+      
       try {
-        if (peerConnection) {
-          peerConnection.close();
-          peerConnection = null;
-        }
+        console.log('Ending call');
+        isCallActive = false;
+
+        // Останавливаем все медиапотоки
         if (localStream) {
           localStream.getTracks().forEach(track => track.stop());
           localStream = null;
@@ -579,22 +630,33 @@
           remoteStream.getTracks().forEach(track => track.stop());
           remoteStream = null;
         }
-        if (callId) {
-          await supabase.from('calls').update({ status: 'ended' }).eq('id', callId);
-          callId = null;
+
+        // Закрываем peer connection
+        if (peerConnection) {
+          peerConnection.close();
+          peerConnection = null;
         }
-        statusEl.innerText = 'Звонок завершен';
-        localVideo.srcObject = null;
-        remoteVideo.srcObject = null;
-        endCallBtn.disabled = true;
-        
+
+        // Обновляем статус звонка в базе данных
+        if (callId) {
+          await supabase.from('calls')
+            .update({ status: 'ended', ended_at: new Date().toISOString() })
+            .eq('id', callId);
+        }
+
+        // Отписываемся от изменений
         if (callSubscription) {
           callSubscription.unsubscribe();
         }
-        
+
+        statusEl.innerText = 'Звонок завершен';
+        endCallBtn.disabled = true;
+
+        // Перенаправляем через 2 секунды
         setTimeout(() => {
-          window.location.href = 'https://super-random.netlify.app/test';
+          window.location.href = 'https://timchik9272.github.io/Messenger-GitHub-Pages';
         }, 2000);
+
       } catch (err) {
         console.error('endCall error:', err);
       }
@@ -602,10 +664,28 @@
 
     async function subscribeToCalls() {
       try {
-        callSubscription = supabase.channel('calls')
-          .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'calls' }, handleCallUpdate)
-          .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'calls' }, handleCallDelete)
-          .subscribe();
+        callSubscription = supabase.channel('calls-channel')
+          .on('postgres_changes', 
+            { 
+              event: 'UPDATE', 
+              schema: 'public', 
+              table: 'calls',
+              filter: `chat_id=eq.${chatId}`
+            }, 
+            handleCallUpdate
+          )
+          .on('postgres_changes', 
+            { 
+              event: 'DELETE', 
+              schema: 'public', 
+              table: 'calls',
+              filter: `chat_id=eq.${chatId}`
+            }, 
+            handleCallDelete
+          )
+          .subscribe((status) => {
+            console.log('Subscription status:', status);
+          });
       } catch (err) {
         console.error('subscribeToCalls error:', err);
       }
@@ -613,20 +693,45 @@
 
     async function handleCallUpdate(payload) {
       const call = payload.new;
+      console.log('Call updated:', call);
+      
       if (call.id === callId) {
         if (call.status === 'ended') {
           endCall();
-        } else if (call.answer && isCaller && peerConnection) {
+          return;
+        }
+
+        // Если мы отвечающий и получили офер
+        if (!isCaller && call.offer && peerConnection && peerConnection.signalingState === 'stable') {
+          try {
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(call.offer));
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+            
+            await supabase.from('calls')
+              .update({ answer: answer, status: 'answered' })
+              .eq('id', callId);
+          } catch (err) {
+            console.error('Error handling offer:', err);
+          }
+        }
+
+        // Если мы звоним и получили ответ
+        if (isCaller && call.answer && peerConnection && peerConnection.signalingState === 'have-local-offer') {
           try {
             await peerConnection.setRemoteDescription(new RTCSessionDescription(call.answer));
-            statusEl.innerText = 'Соединение установлено';
           } catch (err) {
-            console.error('Error setting answer:', err);
+            console.error('Error setting remote description:', err);
           }
-        } else if (call.ice_candidates && call.ice_candidates.length > 0 && peerConnection) {
+        }
+
+        // Обработка ICE кандидатов
+        if (call.ice_candidates && call.ice_candidates.length > 0 && peerConnection) {
           for (const candidate of call.ice_candidates) {
             try {
-              await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+              if (peerConnection.remoteDescription) {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+              }
             } catch (err) {
               console.error('Error adding ICE candidate:', err);
             }
@@ -637,80 +742,88 @@
 
     async function handleCallDelete(payload) {
       if (payload.old.id === callId) {
+        console.log('Call deleted from database');
         endCall();
       }
     }
 
     async function answerCall(call) {
       try {
+        console.log('Answering call:', call.id);
+        
         if (!call.offer) {
-          console.error('Invalid offer in answerCall');
+          console.error('No offer in call');
           return;
         }
 
+        // Получаем медиапоток
         localStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: facingMode },
+          video: { facingMode: facingMode, width: 1280, height: 720 },
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl: true,
-            sampleRate: 48000
+            autoGainControl: true
           }
         });
         localVideo.srcObject = localStream;
 
+        // Создаем peer connection
         peerConnection = new RTCPeerConnection(servers);
-        localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
 
+        // Добавляем треки локального потока
+        localStream.getTracks().forEach(track => {
+          peerConnection.addTrack(track, localStream);
+        });
+
+        // Создаем удаленный поток
         remoteStream = new MediaStream();
         remoteVideo.srcObject = remoteStream;
+
+        // Обработка удаленного потока
         peerConnection.ontrack = (event) => {
-          event.streams[0].getTracks().forEach(track => remoteStream.addTrack(track));
+          console.log('Received remote track:', event.track.kind);
+          remoteStream.addTrack(event.track);
         };
 
-        peerConnection.onicecandidate = async (event) => {
+        // Обработка ICE кандидатов
+        peerConnection.onicecandidate = (event) => {
           if (event.candidate) {
-            try {
-              await supabase.from('calls').update({
-                ice_candidates: [...(await getCurrentIceCandidates() || []), event.candidate]
-              }).eq('id', callId);
-            } catch (err) {
-              console.error('Error sending ICE candidate:', err);
-            }
+            sendIceCandidate(event.candidate);
           }
         };
 
+        // Обработка изменения состояния соединения
         peerConnection.onconnectionstatechange = () => {
+          console.log('Connection state changed:', peerConnection.connectionState);
           if (peerConnection.connectionState === 'connected') {
             statusEl.innerText = 'Соединение установлено';
-          } else if (peerConnection.connectionState === 'failed') {
-            endCall();
+            isCallActive = true;
           }
         };
 
+        // Устанавливаем удаленное описание (офер)
         await peerConnection.setRemoteDescription(new RTCSessionDescription(call.offer));
+
+        // Создаем ответ
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
-        await supabase.from('calls').update({ answer: answer, status: 'answered' }).eq('id', callId);
 
+        // Обновляем запись звонка ответом
+        await supabase.from('calls')
+          .update({ answer: answer, status: 'answered' })
+          .eq('id', call.id);
+
+        callId = call.id;
         statusEl.innerText = 'Соединение устанавливается...';
         endCallBtn.disabled = false;
+
       } catch (err) {
         console.error('answerCall error:', err);
-        statusEl.innerText = 'Ошибка ответа на звонок';
+        statusEl.innerText = 'Ошибка ответа на звонок: ' + err.message;
       }
     }
 
-    async function getCurrentIceCandidates() {
-      try {
-        const { data } = await supabase.from('calls').select('ice_candidates').eq('id', callId).single();
-        return data?.ice_candidates || [];
-      } catch (err) {
-        console.error('Error fetching ICE candidates:', err);
-        return [];
-      }
-    }
-
+    // Управление медиа
     toggleMicBtn.onclick = () => {
       if (localStream) {
         micEnabled = !micEnabled;
@@ -735,13 +848,19 @@
             video: { facingMode: facingMode } 
           });
           const newVideoTrack = newVideoStream.getVideoTracks()[0];
-          localStream.getVideoTracks().forEach(track => track.stop());
-          localStream.addTrack(newVideoTrack);
-          localVideo.srcObject = localStream;
+          
+          // Заменяем видео трек
           const sender = peerConnection.getSenders().find(s => s.track.kind === 'video');
           if (sender) {
-            sender.replaceTrack(newVideoTrack);
+            await sender.replaceTrack(newVideoTrack);
           }
+          
+          // Обновляем локальный поток
+          const oldVideoTrack = localStream.getVideoTracks()[0];
+          localStream.removeTrack(oldVideoTrack);
+          localStream.addTrack(newVideoTrack);
+          oldVideoTrack.stop();
+          
         } catch (err) {
           console.error('Error switching camera:', err);
         }
@@ -753,15 +872,15 @@
     };
 
     window.addEventListener('load', init);
-    window.addEventListener('beforeunload', async () => {
-      if (callId) {
-        try {
-          await supabase.from('calls').update({ status: 'ended' }).eq('id', callId);
-        } catch (err) {
-          console.error('Error cleaning up call on unload:', err);
-        }
+
+    window.addEventListener('beforeunload', async (e) => {
+      if (isCallActive) {
+        e.preventDefault();
+        e.returnValue = '';
+        await endCall();
       }
     });
+
   </script>
 </body>
-</html>
+  </html>
