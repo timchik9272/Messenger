@@ -226,6 +226,11 @@
       font-size: 14px;
       margin-top: 5px;
     }
+    .loading {
+      color: var(--accent);
+      font-size: 16px;
+      margin: 20px 0;
+    }
   </style>
 </head>
 <body>
@@ -235,6 +240,10 @@
     <input type="password" id="password" placeholder="Пароль" />
     <button id="login-btn" class="login-btn">Войти</button>
     <div id="login-error" class="error"></div>
+  </div>
+
+  <div id="loading-container" class="login-container">
+    <div class="loading">Загрузка...</div>
   </div>
 
   <div id="call-container" class="call-container" style="display: none;">
@@ -250,7 +259,7 @@
       <button id="switch-camera" title="Переключить камеру"><i class="fa fa-sync-alt"></i></button>
       <button id="swap-video" title="Поменять местами"><i class="fa fa-exchange-alt"></i></button>
       <button id="fullscreen-toggle" title="На весь экран"><i class="fa fa-expand"></i></button>
-      <button id="end-call" class="end-call-btn" onclick="endCall()"><i class="fa fa-phone-slash"></i></button>
+      <button id="end-call" class="end-call-btn"><i class="fa fa-phone-slash"></i></button>
     </div>
   </div>
 
@@ -274,6 +283,7 @@
     let facingMode = 'user';
 
     const loginContainer = document.getElementById('login-container');
+    const loadingContainer = document.getElementById('loading-container');
     const callContainer = document.getElementById('call-container');
     const emailInput = document.getElementById('email');
     const passwordInput = document.getElementById('password');
@@ -331,6 +341,7 @@
       try {
         if (urlSignout) {
           await supabase.auth.signOut();
+          console.log('Signed out due to signout=true parameter');
         }
 
         const { data, error } = await supabase.auth.signInWithPassword({
@@ -341,6 +352,7 @@
         if (error) throw error;
 
         currentUser = data.user;
+        console.log('Successfully logged in via URL parameters');
         await checkBanAndProceed();
       } catch (err) {
         console.error('URL login error:', err);
@@ -350,20 +362,32 @@
     }
 
     async function checkBanAndProceed() {
-      const { data: profile } = await supabase.from('profiles').select('ban, username').eq('id', currentUser.id).single();
-      
-      if (profile.ban) {
-        await supabase.auth.signOut();
-        showLoginForm();
-        loginError.textContent = 'Ваш аккаунт заблокирован';
-        return;
-      }
+      try {
+        const { data: profile, error } = await supabase.from('profiles')
+          .select('ban, username')
+          .eq('id', currentUser.id)
+          .single();
+        
+        if (error) throw error;
+        
+        if (profile.ban) {
+          await supabase.auth.signOut();
+          showLoginForm();
+          loginError.textContent = 'Ваш аккаунт заблокирован';
+          return;
+        }
 
-      showCallInterface();
-      await setupCall();
+        showCallInterface();
+        await setupCall();
+      } catch (err) {
+        console.error('Ban check error:', err);
+        showLoginForm();
+        loginError.textContent = 'Ошибка проверки аккаунта';
+      }
     }
 
     function showLoginForm() {
+      loadingContainer.style.display = 'none';
       loginContainer.style.display = 'flex';
       callContainer.style.display = 'none';
       
@@ -385,6 +409,7 @@
     }
 
     function showCallInterface() {
+      loadingContainer.style.display = 'none';
       loginContainer.style.display = 'none';
       callContainer.style.display = 'flex';
     }
@@ -395,88 +420,297 @@
         return;
       }
 
-      const { data: chat } = await supabase.from('chats')
-        .select('id, user1, user2')
-        .eq('id', urlChatId)
-        .single();
-
-      if (chat) {
-        chatId = chat.id;
-        otherUserId = chat.user1 === currentUser.id ? chat.user2 : chat.user1;
-        const { data: otherProfile } = await supabase.from('profiles')
-          .select('username')
-          .eq('id', otherUserId)
+      try {
+        const { data: chat, error: chatError } = await supabase.from('chats')
+          .select('id, user1, user2')
+          .eq('id', urlChatId)
           .single();
-        callTitle.innerText = `Звонок с ${otherProfile?.username || 'Пользователь'}`;
-      } else {
-        statusEl.innerText = 'Чат не найден';
-        return;
-      }
 
-      const { data: existingCall } = await supabase.from('calls')
-        .select('*')
-        .eq('chat_id', chatId)
-        .eq('status', 'initiated')
-        .single();
+        if (chatError) throw chatError;
 
-      if (existingCall) {
-        callId = existingCall.id;
-        isCaller = existingCall.caller_id === currentUser.id;
-        if (isCaller) {
-          await startCall();
-        } else if (existingCall.offer) {
-          await answerCall(existingCall);
+        if (chat) {
+          chatId = chat.id;
+          otherUserId = chat.user1 === currentUser.id ? chat.user2 : chat.user1;
+          const { data: otherProfile } = await supabase.from('profiles')
+            .select('username')
+            .eq('id', otherUserId)
+            .single();
+          callTitle.innerText = `Звонок с ${otherProfile?.username || 'Пользователь'}`;
+        } else {
+          statusEl.innerText = 'Чат не найден';
+          return;
         }
-      } else {
-        isCaller = true;
-        await startCall();
+
+        const { data: existingCall, error: callError } = await supabase.from('calls')
+          .select('*')
+          .eq('chat_id', chatId)
+          .eq('status', 'initiated')
+          .single();
+
+        if (callError && callError.code !== 'PGRST116') {
+          console.error('Error checking existing call:', callError);
+        }
+
+        if (existingCall) {
+          callId = existingCall.id;
+          isCaller = existingCall.caller_id === currentUser.id;
+          if (isCaller) {
+            await startCall();
+          } else if (existingCall.offer) {
+            await answerCall(existingCall);
+          } else {
+            statusEl.innerText = 'Ожидание предложения для звонка...';
+          }
+        } else {
+          isCaller = true;
+          await startCall();
+        }
+
+        subscribeToCalls();
+
+        fullscreenToggleBtn.onclick = () => {
+          videoGrid.classList.toggle('fullscreen-remote');
+          fullscreenToggleBtn.innerHTML = `<i class="fa fa-${videoGrid.classList.contains('fullscreen-remote') ? 'compress' : 'expand'}"></i>`;
+        };
+
+        endCallBtn.onclick = endCall;
+
+      } catch (err) {
+        console.error('Setup call error:', err);
+        statusEl.innerText = 'Ошибка настройки звонка';
       }
-
-      subscribeToCalls();
-
-      fullscreenToggleBtn.onclick = () => {
-        videoGrid.classList.toggle('fullscreen-remote');
-        fullscreenToggleBtn.innerHTML = `<i class="fa fa-${videoGrid.classList.contains('fullscreen-remote') ? 'compress' : 'expand'}"></i>`;
-      };
     }
 
-    // Остальные функции (startCall, endCall, subscribeToCalls, handleCallInsert, 
-    // handleCallUpdate, handleCallDelete, answerCall, getCurrentIceCandidates, 
-    // управление медиа) остаются без изменений, как в вашем исходном коде
-
     async function startCall() {
-      // ... (ваш исходный код startCall)
+      try {
+        console.log('Starting call, isCaller:', isCaller, 'chatId:', chatId);
+        
+        localStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: facingMode },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: 48000
+          }
+        });
+        localVideo.srcObject = localStream;
+
+        peerConnection = new RTCPeerConnection(servers);
+        localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+        remoteStream = new MediaStream();
+        remoteVideo.srcObject = remoteStream;
+        peerConnection.ontrack = (event) => {
+          event.streams[0].getTracks().forEach(track => remoteStream.addTrack(track));
+        };
+
+        peerConnection.onicecandidate = async (event) => {
+          if (event.candidate) {
+            try {
+              await supabase.from('calls').update({
+                ice_candidates: [...(await getCurrentIceCandidates() || []), event.candidate]
+              }).eq('id', callId);
+            } catch (err) {
+              console.error('Error sending ICE candidate:', err);
+            }
+          }
+        };
+
+        peerConnection.onconnectionstatechange = () => {
+          console.log('Connection state:', peerConnection.connectionState);
+          if (peerConnection.connectionState === 'connected') {
+            statusEl.innerText = 'Соединение установлено';
+          } else if (peerConnection.connectionState === 'failed') {
+            console.error('Connection failed');
+            endCall();
+          }
+        };
+
+        if (!callId) {
+          const offer = await peerConnection.createOffer({
+            offerToReceiveAudio: true,
+            offerToReceiveVideo: true
+          });
+          await peerConnection.setLocalDescription(offer);
+          
+          const { data: callData, error } = await supabase.from('calls').insert({
+            caller_id: currentUser.id,
+            receiver_id: otherUserId,
+            chat_id: chatId,
+            status: 'initiated',
+            offer: offer,
+            answer: null,
+            ice_candidates: []
+          }).select('id').single();
+          
+          if (error) throw error;
+          
+          callId = callData.id;
+          
+          const messageContent = `Я звоню вам. Присоединяйтесь: ${window.location.origin}${window.location.pathname}?chat_id=${chatId}`;
+          await supabase.from('messages').insert({
+            chat_id: chatId,
+            sender: currentUser.id,
+            content: messageContent,
+            read: false
+          });
+        }
+
+        statusEl.innerText = isCaller ? 'Ожидание ответа...' : 'Соединение устанавливается...';
+        endCallBtn.disabled = false;
+      } catch (err) {
+        console.error('startCall error:', err);
+        statusEl.innerText = 'Ошибка начала звонка';
+      }
     }
 
     async function endCall() {
-      // ... (ваш исходный код endCall)
+      try {
+        if (peerConnection) {
+          peerConnection.close();
+          peerConnection = null;
+        }
+        if (localStream) {
+          localStream.getTracks().forEach(track => track.stop());
+          localStream = null;
+        }
+        if (remoteStream) {
+          remoteStream.getTracks().forEach(track => track.stop());
+          remoteStream = null;
+        }
+        if (callId) {
+          await supabase.from('calls').update({ status: 'ended' }).eq('id', callId);
+          callId = null;
+        }
+        statusEl.innerText = 'Звонок завершен';
+        localVideo.srcObject = null;
+        remoteVideo.srcObject = null;
+        endCallBtn.disabled = true;
+        
+        if (callSubscription) {
+          callSubscription.unsubscribe();
+        }
+        
+        setTimeout(() => {
+          window.location.href = 'https://super-random.netlify.app/test';
+        }, 2000);
+      } catch (err) {
+        console.error('endCall error:', err);
+      }
     }
 
     async function subscribeToCalls() {
-      // ... (ваш исходный код subscribeToCalls)
-    }
-
-    async function handleCallInsert(payload) {
-      // ... (ваш исходный код handleCallInsert)
+      try {
+        callSubscription = supabase.channel('calls')
+          .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'calls' }, handleCallUpdate)
+          .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'calls' }, handleCallDelete)
+          .subscribe();
+      } catch (err) {
+        console.error('subscribeToCalls error:', err);
+      }
     }
 
     async function handleCallUpdate(payload) {
-      // ... (ваш исходный код handleCallUpdate)
+      const call = payload.new;
+      if (call.id === callId) {
+        if (call.status === 'ended') {
+          endCall();
+        } else if (call.answer && isCaller && peerConnection) {
+          try {
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(call.answer));
+            statusEl.innerText = 'Соединение установлено';
+          } catch (err) {
+            console.error('Error setting answer:', err);
+          }
+        } else if (call.ice_candidates && call.ice_candidates.length > 0 && peerConnection) {
+          for (const candidate of call.ice_candidates) {
+            try {
+              await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+            } catch (err) {
+              console.error('Error adding ICE candidate:', err);
+            }
+          }
+        }
+      }
     }
 
     async function handleCallDelete(payload) {
-      // ... (ваш исходный код handleCallDelete)
+      if (payload.old.id === callId) {
+        endCall();
+      }
     }
 
     async function answerCall(call) {
-      // ... (ваш исходный код answerCall)
+      try {
+        if (!call.offer) {
+          console.error('Invalid offer in answerCall');
+          return;
+        }
+
+        localStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: facingMode },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: 48000
+          }
+        });
+        localVideo.srcObject = localStream;
+
+        peerConnection = new RTCPeerConnection(servers);
+        localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+        remoteStream = new MediaStream();
+        remoteVideo.srcObject = remoteStream;
+        peerConnection.ontrack = (event) => {
+          event.streams[0].getTracks().forEach(track => remoteStream.addTrack(track));
+        };
+
+        peerConnection.onicecandidate = async (event) => {
+          if (event.candidate) {
+            try {
+              await supabase.from('calls').update({
+                ice_candidates: [...(await getCurrentIceCandidates() || []), event.candidate]
+              }).eq('id', callId);
+            } catch (err) {
+              console.error('Error sending ICE candidate:', err);
+            }
+          }
+        };
+
+        peerConnection.onconnectionstatechange = () => {
+          if (peerConnection.connectionState === 'connected') {
+            statusEl.innerText = 'Соединение установлено';
+          } else if (peerConnection.connectionState === 'failed') {
+            endCall();
+          }
+        };
+
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(call.offer));
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        await supabase.from('calls').update({ answer: answer, status: 'answered' }).eq('id', callId);
+
+        statusEl.innerText = 'Соединение устанавливается...';
+        endCallBtn.disabled = false;
+      } catch (err) {
+        console.error('answerCall error:', err);
+        statusEl.innerText = 'Ошибка ответа на звонок';
+      }
     }
 
     async function getCurrentIceCandidates() {
-      // ... (ваш исходный код getCurrentIceCandidates)
+      try {
+        const { data } = await supabase.from('calls').select('ice_candidates').eq('id', callId).single();
+        return data?.ice_candidates || [];
+      } catch (err) {
+        console.error('Error fetching ICE candidates:', err);
+        return [];
+      }
     }
 
-    // Управление медиа
     toggleMicBtn.onclick = () => {
       if (localStream) {
         micEnabled = !micEnabled;
@@ -522,7 +756,7 @@
     window.addEventListener('beforeunload', async () => {
       if (callId) {
         try {
-          await supabase.from('calls').delete().eq('id', callId);
+          await supabase.from('calls').update({ status: 'ended' }).eq('id', callId);
         } catch (err) {
           console.error('Error cleaning up call on unload:', err);
         }
