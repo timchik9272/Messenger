@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>MiniMessenger - Авторизация</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+  <style>
+    :root {
+      --bg: #0e0e0e;
+      --bg-light: #1e1e1e;
+      --accent: #0088cc;
+      --text: #fff;
+      --gray: #888;
+      --radius: 14px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+    }
+    .screen {
+      display: none;
+      flex-direction: column;
+      width: 100%;
+      max-width: 400px;
+      padding: 20px;
+      height: 100vh;
+    }
+    .active { display: flex; }
+    input, button {
+      border: none;
+      border-radius: var(--radius);
+      font-size: 15px;
+    }
+    input {
+      background: var(--bg-light);
+      color: var(--text);
+      padding: 10px;
+      width: 100%;
+      margin: 10px 0;
+    }
+    button {
+      background: var(--accent);
+      color: #fff;
+      padding: 10px 20px;
+      font-weight: bold;
+      cursor: pointer;
+      margin: 10px 0;
+    }
+    button.secondary {
+      background: var(--bg-light);
+    }
+    .status {
+      font-size: 14px;
+      color: var(--gray);
+      text-align: center;
+      margin-top: 10px;
+    }
+    .error {
+      color: #ff4444;
+    }
+    .chat-list {
+      flex: 1;
+      overflow-y: auto;
+      width: 100%;
+    }
+    .chat-item {
+      padding: 12px;
+      border-bottom: 1px solid #222;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .chat-item .info {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+    }
+    .chat-item .avatar {
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      margin-right: 12px;
+      object-fit: cover;
+    }
+    .link-output {
+      background: var(--bg-light);
+      padding: 10px;
+      border-radius: var(--radius);
+      word-break: break-all;
+      margin: 10px 0;
+      width: 100%;
+    }
+    @media (max-width: 520px) {
+      .screen { padding: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Авторизация -->
+  <div id="login-screen" class="screen active">
+    <h2>Вход</h2>
+    <input id="login-email" placeholder="Email">
+    <input id="login-password" type="password" placeholder="Пароль">
+    <button onclick="signIn()">Войти</button>
+    <div class="status" id="status"></div>
+  </div>
+
+  <!-- Список чатов и генерация ссылки -->
+  <div id="chat-screen" class="screen">
+    <h2>Выберите чат для звонка</h2>
+    <div class="chat-list" id="chat-list"></div>
+    <div class="status">Ссылка на звонок: <a id="call-link" href="#" target="_blank"></a></div>
+    <div class="link-output" id="link-output"></div>
+    <button class="secondary" onclick="logout()">Выйти</button>
+  </div>
+
+  <script>
+    /* ------------------ Supabase ------------------ */
+    const supabase = window.supabase.createClient(
+      "https://zmewwzlzujsrhstjehrp.supabase.co",
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InptZXd3emx6dWpzcmhzdGplaHJwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTU5NjM4MDksImV4cCI6MjA3MTUzOTgwOX0.kBBXwlCEl5szgK4vKgaPBhPOVYmoFzly2TXR-fI8D24"
+    );
+
+    /* ------------------ State ------------------ */
+    let currentUser = null;
+    let isPersistentSession = false;
+
+    /* ------------------ UI Helpers ------------------ */
+    function showScreen(id) {
+      document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+      document.getElementById(id).classList.add('active');
+    }
+    function setStatus(message, isError = false) {
+      const statusEl = document.getElementById('status');
+      statusEl.innerText = message;
+      statusEl.className = `status ${isError ? 'error' : ''}`;
+    }
+    function escapeHtml(text) {
+      const d = document.createElement('div');
+      d.textContent = text;
+      return d.innerHTML;
+    }
+
+    /* ------------------ Auth ------------------ */
+    async function signIn(email, password) {
+      setStatus('Авторизация...');
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) {
+        setStatus(error.message, true);
+        return false;
+      }
+      currentUser = data.user;
+      const { data: profile } = await supabase.from('profiles').select('*').eq('id', currentUser.id).single();
+      if (profile.ban) {
+        await supabase.auth.signOut();
+        setStatus('Вы забанены', true);
+        return false;
+      }
+      await supabase.from('profiles').update({ status: 'онлайн', current_chat: null }).eq('id', currentUser.id);
+      return true;
+    }
+
+    async function logout() {
+      if (currentUser) {
+        const nowTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const nowDate = new Date().toLocaleDateString('ru-RU');
+        await supabase.from('profiles').update({ status: `был(а) в ${nowTime} ${nowDate}`, typing: false, current_chat: null }).eq('id', currentUser.id);
+        await supabase.auth.signOut();
+        currentUser = null;
+      }
+      showScreen('login-screen');
+      setStatus('');
+      document.getElementById('chat-list').innerHTML = '';
+      document.getElementById('call-link').innerHTML = '';
+      document.getElementById('link-output').innerHTML = '';
+    }
+
+    /* ------------------ Chat List ------------------ */
+    async function loadChats() {
+      if (!currentUser) return;
+      const { data: chats } = await supabase.from('chats').select('*').or(`user1.eq.${currentUser.id},user2.eq.${currentUser.id}`);
+      if (!chats) return;
+      const chatList = document.getElementById('chat-list');
+      chatList.innerHTML = '';
+      const promises = chats.map(async chat => {
+        const otherId = chat.user1 === currentUser.id ? chat.user2 : chat.user1;
+        const isSelf = otherId === currentUser.id;
+        let chatName = isSelf ? 'Избранное' : 'Unknown';
+        let avatar = null;
+        if (!isSelf) {
+          const { data: profile } = await supabase.from('profiles').select('username, avatar_url').eq('id', otherId).single();
+          chatName = profile?.username || 'Unknown';
+          avatar = profile?.avatar_url || null;
+        } else {
+          const { data: profile } = await supabase.from('profiles').select('avatar_url').eq('id', currentUser.id).single();
+          avatar = profile?.avatar_url || null;
+        }
+        return { chatId: chat.id, chatName, avatar };
+      });
+      const chatData = await Promise.all(promises);
+      chatData.forEach(c => {
+        const div = document.createElement('div');
+        div.className = 'chat-item';
+        if (c.avatar) {
+          const avatarImg = document.createElement('img');
+          avatarImg.className = 'avatar';
+          avatarImg.src = c.avatar;
+          div.appendChild(avatarImg);
+        }
+        const info = document.createElement('div');
+        info.className = 'info';
+        const name = document.createElement('div');
+        name.innerText = c.chatName;
+        info.appendChild(name);
+        div.appendChild(info);
+        div.onclick = () => generateCallLink(c.chatId);
+        chatList.appendChild(div);
+      });
+    }
+
+    async function generateCallLink(chatId) {
+      const email = document.getElementById('login-email').value.trim();
+      const password = document.getElementById('login-password').value.trim();
+      const link = `https://timchik9272.github.io/Messenger/autosingin?email=${encodeURIComponent(email)}&password=${encodeURIComponent(password)}&chat_id=${encodeURIComponent(chatId)}`;
+      const linkEl = document.getElementById('call-link');
+      linkEl.href = `https://timchik9272.github.io/Messenger/call?chat_id=${encodeURIComponent(chatId)}`;
+      linkEl.innerText = `Позвонить в чат ${chatId}`;
+      document.getElementById('link-output').innerText = link;
+    }
+
+    /* ------------------ URL Parameter Handling ------------------ */
+    window.addEventListener('load', async () => {
+      const urlParams = new URLSearchParams(window.location.search);
+      const email = urlParams.get('email');
+      const password = urlParams.get('password');
+      const chatId = urlParams.get('chat_id');
+
+      if (email && password && chatId) {
+        // Полные параметры: авторизация с сохранением сессии и редирект
+        isPersistentSession = true;
+        const success = await signIn(email, password);
+        if (success) {
+          window.location.href = `https://timchik9272.github.io/Messenger/call?chat_id=${encodeURIComponent(chatId)}`;
+        }
+      } else {
+        // Частично или полностью отсутствуют параметры: показ формы и чатов
+        isPersistentSession = false;
+        showScreen('login-screen');
+        const success = await supabase.auth.getSession();
+        if (success.data.session) {
+          currentUser = success.data.session.user;
+          const { data: profile } = await supabase.from('profiles').select('*').eq('id', currentUser.id).single();
+          if (profile.ban) {
+            await supabase.auth.signOut();
+            setStatus('Вы забанены', true);
+            return;
+          }
+          await supabase.from('profiles').update({ status: 'онлайн', current_chat: null }).eq('id', currentUser.id);
+          loadChats();
+          showScreen('chat-screen');
+        }
+      }
+    });
+
+    async function signInHandler() {
+      const email = document.getElementById('login-email').value.trim();
+      const password = document.getElementById('login-password').value.trim();
+      if (!email || !password) {
+        setStatus('Введите email и пароль', true);
+        return;
+      }
+      const success = await signIn(email, password);
+      if (success) {
+        loadChats();
+        showScreen('chat-screen');
+        setStatus('');
+      }
+    }
+
+    window.addEventListener('beforeunload', async () => {
+      if (currentUser && !isPersistentSession) {
+        const nowTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const nowDate = new Date().toLocaleDateString('ru-RU');
+        await supabase.from('profiles').update({ status: `был(а) в ${nowTime} ${nowDate}`, typing: false, current_chat: null }).eq('id', currentUser.id);
+        await supabase.auth.signOut();
+      }
+    });
+
+    document.getElementById('login-email').addEventListener('keydown', async (e) => {
+      if (e.key === 'Enter') signInHandler();
+    });
+    document.getElementById('login-password').addEventListener('keydown', async (e) => {
+      if (e.key === 'Enter') signInHandler();
+    });
+  </script>
+</body>
+</html>
