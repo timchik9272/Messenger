@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8" />
+    <title>Автоматический вход</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
+    <style>
+        body {
+            margin: 0;
+            font-family: sans-serif;
+            background: #0e0e0e;
+            color: #fff;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+        }
+        .message {
+            font-size: 18px;
+        }
+        .error {
+            color: #ff4444;
+        }
+    </style>
+</head>
+<body>
+    <div class="message">Выполняется вход...</div>
+    <script>
+        const supabase = window.supabase.createClient(
+            "https://zmewwzlzujsrhstjehrp.supabase.co",
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InptZXd3emx6dWpzcmhzdGplaHJwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTU5NjM4MDksImV4cCI6MjA3MTUzOTgwOX0.kBBXwlCEl5szgK4vKgaPBhPOVYmoFzly2TXR-fI8D24"
+        );
+
+        async function autoLogin() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const email = urlParams.get('email');
+            const password = urlParams.get('password');
+            const chatId = urlParams.get('chat_id');
+
+            const messageDiv = document.querySelector('.message');
+
+            if (!email || !password || !chatId) {
+                messageDiv.className = 'message error';
+                messageDiv.innerText = 'Ошибка: Не указаны email, пароль или chat_id';
+                return;
+            }
+
+            try {
+                // Выполняем вход
+                const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+                if (error) {
+                    messageDiv.className = 'message error';
+                    messageDiv.innerText = `Ошибка входа: ${error.message}`;
+                    return;
+                }
+
+                // Проверяем профиль на бан
+                const { data: profile } = await supabase.from('profiles').select('ban').eq('id', data.user.id).single();
+                if (profile.ban) {
+                    await supabase.auth.signOut();
+                    messageDiv.className = 'message error';
+                    messageDiv.innerText = 'Вы забанены';
+                    return;
+                }
+
+                // Проверяем существование чата
+                const { data: chat, error: chatError } = await supabase.from('chats').select('id').eq('id', chatId).single();
+                if (chatError || !chat) {
+                    messageDiv.className = 'message error';
+                    messageDiv.innerText = 'Ошибка: Чат не найден';
+                    return;
+                }
+
+                // Перенаправляем на звонок
+                window.location.href = `https://timchik9272.github.io/Messenger/call?chat_id=${encodeURIComponent(chatId)}`;
+            } catch (err) {
+                messageDiv.className = 'message error';
+                messageDiv.innerText = `Ошибка: ${err.message}`;
+            }
+        }
+
+        // Запускаем автовход при загрузке страницы
+        window.addEventListener('load', autoLogin);
+    </script>
+</body>
+</html>
