@@ -442,7 +442,7 @@ async function openChat(chatId, otherName, otherId, otherAvatar = null){
   document.getElementById('typing-status').innerText = '';
   const callLink = document.getElementById('call-link');
   if(!isSelf){
-    callLink.href = `https://timchik9272.github.io/Messenger/call?chat_id=${encodeURIComponent(chatId)}`;
+    callLink.href = `https://timchik9272.github.io/Messenger-GitHub-Pages/call?chat_id=${encodeURIComponent(chatId)}`;
     callLink.style.display = 'block';
   } else {
     callLink.style.display = 'none';
